@@ -60,6 +60,11 @@ def get_arguments():
         type=bool,
         default=True,
         help='Use fast generation')
+    parser.add_argument(
+        '--wav_seed',
+        type=str,
+        default=None,
+        help='The wav file to start generation from')
     return parser.parse_args()
 
 
