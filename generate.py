@@ -21,26 +21,6 @@ SAVE_EVERY = None
 
 def get_arguments():
     parser = argparse.ArgumentParser(description='WaveNet generation script')
-<<<<<<< HEAD
-    parser.add_argument('checkpoint', type=str,
-                        help='Which model checkpoint to generate from')
-    parser.add_argument('--samples', type=int, default=SAMPLES,
-                        help='How many waveform samples to generate')
-    parser.add_argument('--logdir', type=str, default=LOGDIR,
-                        help='Directory in which to store the logging '
-                        'information for TensorBoard.')
-    parser.add_argument('--window', type=int, default=WINDOW,
-                        help='The number of past samples to take into '
-                        'account at each step')
-    parser.add_argument('--wavenet_params', type=str, default=WAVENET_PARAMS,
-                        help='JSON file with the network parameters')
-    parser.add_argument('--wav_out_path', type=str, default=None,
-                        help='Path to output wav file')
-    parser.add_argument('--save_every', type=int, default=SAVE_EVERY,
-                        help='How many samples before saving in-progress wav')
-    parser.add_argument('--wav_seed', type=str, default=None,
-                        help='The wav file to start generation from')
-=======
     parser.add_argument(
         'checkpoint', type=str, help='Which model checkpoint to generate from')
     parser.add_argument(
@@ -80,7 +60,6 @@ def get_arguments():
         type=bool,
         default=True,
         help='Use fast generation')
->>>>>>> upstream/master
     return parser.parse_args()
 
 
@@ -134,7 +113,6 @@ def main():
     decode = mu_law_decode(samples, wavenet_params['quantization_channels'])
 
     quantization_channels = wavenet_params['quantization_channels']
-<<<<<<< HEAD
     if args.wav_seed:
         seed = create_seed(args.wav_seed,
                     wavenet_params['sample_rate'],
@@ -143,9 +121,6 @@ def main():
     else:
         waveform = np.random.randint(quantization_channels, size=(1,)).tolist()
 
-=======
-    waveform = np.random.randint(quantization_channels, size=(1, )).tolist()
->>>>>>> upstream/master
     for step in range(args.samples):
         if args.fast_generation:
             window = waveform[-1]
