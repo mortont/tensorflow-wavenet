@@ -11,22 +11,25 @@ import argparse
 from datetime import datetime
 import json
 import os
+import sys
 import time
 
 import tensorflow as tf
 from tensorflow.python.client import timeline
 
-from wavenet import WaveNet
-from audio_reader import AudioReader
+from wavenet import WaveNetModel, AudioReader
 
 BATCH_SIZE = 1
 DATA_DIRECTORY = './VCTK-Corpus'
 LOGDIR_ROOT = './logdir'
+CHECKPOINT_EVERY = 50
 NUM_STEPS = 4000
 LEARNING_RATE = 0.02
 WAVENET_PARAMS = './wavenet_params.json'
 STARTED_DATESTRING = "{0:%Y-%m-%dT%H-%M-%S}".format(datetime.now())
 SAMPLE_SIZE = 100000
+L2_REGULARIZATION_STRENGTH = 0
+SILENCE_THRESHOLD = 0.3
 
 
 def get_arguments():
@@ -55,6 +58,8 @@ def get_arguments():
                         'This creates the new model under the dated directory '
                         'in --logdir_root. '
                         'Cannot use with --logdir.')
+    parser.add_argument('--checkpoint_every', type=int, default=CHECKPOINT_EVERY,
+                        help='How many steps to save each checkpoint after')
     parser.add_argument('--num_steps', type=int, default=NUM_STEPS,
                         help='Number of training steps.')
     parser.add_argument('--learning_rate', type=float, default=LEARNING_RATE,
@@ -63,7 +68,15 @@ def get_arguments():
                         help='JSON file with the network parameters.')
     parser.add_argument('--sample_size', type=int, default=SAMPLE_SIZE,
                         help='Concatenate and cut audio samples to this many '
-                        'samples')
+                        'samples.')
+    parser.add_argument('--l2_regularization_strength', type=float,
+                        default=L2_REGULARIZATION_STRENGTH,
+                        help='Coefficient in the L2 regularization. '
+                        'Disabled by default')
+    parser.add_argument('--silence_threshold', type=float,
+                        default=SILENCE_THRESHOLD,
+                        help='Volume threshold below which to trim the start '
+                        'and the end from the training set samples.')
     return parser.parse_args()
 
 
@@ -71,6 +84,7 @@ def save(saver, sess, logdir, step):
     model_name = 'model.ckpt'
     checkpoint_path = os.path.join(logdir, model_name)
     print('Storing checkpoint to {} ...'.format(logdir), end="")
+    sys.stdout.flush()
 
     if not os.path.exists(logdir):
         os.makedirs(logdir)
@@ -175,11 +189,12 @@ def main():
             args.data_dir,
             coord,
             sample_rate=wavenet_params['sample_rate'],
-            sample_size=args.sample_size)
+            sample_size=args.sample_size,
+            silence_threshold=args.silence_threshold)
         audio_batch = reader.dequeue(args.batch_size)
 
     # Create network.
-    net = WaveNet(
+    net = WaveNetModel(
         batch_size=args.batch_size,
         dilations=wavenet_params["dilations"],
         filter_width=wavenet_params["filter_width"],
@@ -188,7 +203,9 @@ def main():
         skip_channels=wavenet_params["skip_channels"],
         quantization_channels=wavenet_params["quantization_channels"],
         use_biases=wavenet_params["use_biases"])
-    loss = net.loss(audio_batch)
+    if args.l2_regularization_strength == 0:
+        args.l2_regularization_strength = None
+    loss = net.loss(audio_batch, args.l2_regularization_strength)
     optimizer = tf.train.AdamOptimizer(learning_rate=args.learning_rate)
     trainable = tf.trainable_variables()
     optim = optimizer.minimize(loss, var_list=trainable)
@@ -215,7 +232,7 @@ def main():
             saved_global_step = -1
 
     except:
-        print("Something is wrong while restoring checkpoint. "
+        print("Something went wrong while restoring checkpoint. "
               "We will terminate training to avoid accidentally overwriting "
               "the previous model.")
         raise
@@ -224,6 +241,7 @@ def main():
     reader.start_threads(sess)
 
     try:
+        last_saved_step = saved_global_step
         for step in range(saved_global_step + 1, args.num_steps):
             start_time = time.time()
             if args.store_metadata and step % 50 == 0:
@@ -250,10 +268,17 @@ def main():
             print('step {:d} - loss = {:.3f}, ({:.3f} sec/step)'
                   .format(step, loss_value, duration))
 
-            if step % 50 == 0:
+            if step % args.checkpoint_every == 0:
                 save(saver, sess, logdir, step)
+                last_saved_step = step
 
+    except KeyboardInterrupt:
+        # Introduce a line break after ^C is displayed so save message
+        # is on its own line.
+        print()
     finally:
+        if step > last_saved_step:
+            save(saver, sess, logdir, step)
         coord.request_stop()
         coord.join(threads)
 

@@ -23,7 +23,7 @@ def load_generic_audio(directory, sample_rate):
     for filename in files:
         audio, _ = librosa.load(filename, sr=sample_rate, mono=True)
         audio = audio.reshape(-1, 1)
-        yield audio
+        yield audio, filename
 
 
 def load_vctk_audio(directory, sample_rate):
@@ -44,7 +44,9 @@ def trim_silence(audio, threshold=0.3):
     energy = librosa.feature.rmse(audio)
     frames = np.nonzero(energy > threshold)
     indices = librosa.core.frames_to_samples(frames)[1]
-    return audio[indices[0]:indices[-1]]
+
+    # Note: indices can be an empty array, if the whole audio was silence.
+    return audio[indices[0]:indices[-1]] if indices.size else audio[0:0]
 
 
 class AudioReader(object):
@@ -56,11 +58,13 @@ class AudioReader(object):
                  coord,
                  sample_rate,
                  sample_size=None,
+                 silence_threshold=0.3,
                  queue_size=256):
         self.audio_dir = audio_dir
         self.sample_rate = sample_rate
         self.coord = coord
         self.sample_size = sample_size
+        self.silence_threshold = silence_threshold
         self.threads = []
         self.sample_placeholder = tf.placeholder(dtype=tf.float32, shape=None)
         self.queue = tf.PaddingFIFOQueue(queue_size,
@@ -78,13 +82,19 @@ class AudioReader(object):
         # Go through the dataset multiple times
         while not stop:
             iterator = load_generic_audio(self.audio_dir, self.sample_rate)
-            for audio in iterator:
+            for audio, filename in iterator:
                 if self.coord.should_stop():
                     self.stop_threads()
                     stop = True
                     break
                 # Remove silence
-                audio = trim_silence(audio[:, 0])
+                audio = trim_silence(audio[:, 0], self.silence_threshold)
+                if audio.size == 0:
+                    print("Warning: {} was ignored as it contains only "
+                          "silence. Consider decreasing trim_silence "
+                          "threshold, or adjust volume of the audio."
+                          .format(filename))
+
                 if self.sample_size:
                     # Cut samples into fixed size pieces
                     buffer_ = np.append(buffer_, audio)

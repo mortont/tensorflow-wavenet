@@ -9,8 +9,7 @@ import librosa
 import numpy as np
 import tensorflow as tf
 
-from wavenet import WaveNet
-from wavenet_ops import mu_law_decode, mu_law_encode
+from wavenet import WaveNetModel, mu_law_decode, mu_law_encode, audio_reader
 
 SAMPLES = 16000
 LOGDIR = './logdir'
@@ -20,6 +19,13 @@ SAVE_EVERY = None
 
 
 def get_arguments():
+    def _str_to_bool(s):
+        """Convert string to bool (in argparse context)."""
+        if s.lower() not in ['true', 'false']:
+            raise ValueError('Argument needs to be a '
+                             'boolean, got {}'.format(s))
+        return {'true': True, 'false': False}[s.lower()]
+
     parser = argparse.ArgumentParser(description='WaveNet generation script')
     parser.add_argument(
         'checkpoint', type=str, help='Which model checkpoint to generate from')
@@ -57,7 +63,7 @@ def get_arguments():
         help='How many samples before saving in-progress wav')
     parser.add_argument(
         '--fast_generation',
-        type=bool,
+        type=_str_to_bool,
         default=True,
         help='Use fast generation')
     parser.add_argument(
@@ -73,23 +79,32 @@ def write_wav(waveform, sample_rate, filename):
     librosa.output.write_wav(filename, y, sample_rate)
     print('Updated wav file at {}'.format(filename))
 
-def create_seed(filename, sample_rate, quantization_channels, window_size=WINDOW):
+
+def create_seed(filename,
+                sample_rate,
+                quantization_channels,
+                window_size=WINDOW):
     audio, _ = librosa.load(filename, sr=sample_rate, mono=True)
+    audio = audio_reader.trim_silence(audio)
 
     quantized = mu_law_encode(audio, quantization_channels)
-    cut_index = tf.size(quantized) + tf.constant(window_size) - tf.constant(1)
+    cut_index = tf.cond(tf.size(quantized) < tf.constant(window_size),
+            lambda: tf.size(quantized),
+            lambda: tf.constant(window_size))
 
     return quantized[:cut_index]
 
+
 def main():
     args = get_arguments()
-    logdir = os.path.join(args.logdir, 'train', str(datetime.now()))
+    started_datestring = "{0:%Y-%m-%dT%H-%M-%S}".format(datetime.now())
+    logdir = os.path.join(args.logdir, 'generate', started_datestring)
     with open(args.wavenet_params, 'r') as config_file:
         wavenet_params = json.load(config_file)
 
     sess = tf.Session()
 
-    net = WaveNet(
+    net = WaveNetModel(
         batch_size=1,
         dilations=wavenet_params['dilations'],
         filter_width=wavenet_params['filter_width'],
@@ -97,19 +112,22 @@ def main():
         dilation_channels=wavenet_params['dilation_channels'],
         quantization_channels=wavenet_params['quantization_channels'],
         skip_channels=wavenet_params['skip_channels'],
-        use_biases=wavenet_params['use_biases'],
-        fast_generation=args.fast_generation)
+        use_biases=wavenet_params['use_biases'])
 
     samples = tf.placeholder(tf.int32)
 
-    next_sample = net.predict_proba(samples)
+    if args.fast_generation:
+        next_sample = net.predict_proba_incremental(samples)
+    else:
+        next_sample = net.predict_proba(samples)
 
     if args.fast_generation:
         sess.run(tf.initialize_all_variables())
         sess.run(net.init_ops)
 
-    variables_to_restore = {var.name[:-2]: var for var in tf.all_variables(
-    ) if not ('state_buffer' in var.name or 'pointer' in var.name)}
+    variables_to_restore = {
+        var.name[:-2]: var for var in tf.all_variables()
+        if not ('state_buffer' in var.name or 'pointer' in var.name)}
     saver = tf.train.Saver(variables_to_restore)
 
     print('Restoring model from {}'.format(args.checkpoint))
@@ -120,17 +138,35 @@ def main():
     quantization_channels = wavenet_params['quantization_channels']
     if args.wav_seed:
         seed = create_seed(args.wav_seed,
-                    wavenet_params['sample_rate'],
-                    quantization_channels)
+                           wavenet_params['sample_rate'],
+                           quantization_channels)
         waveform = sess.run(seed).tolist()
     else:
         waveform = np.random.randint(quantization_channels, size=(1,)).tolist()
 
+    if args.fast_generation and args.wav_seed:
+        # When using the incremental generation, we need to
+        # feed in all priming samples one by one before starting the
+        # actual generation.
+        # TODO This could be done much more efficiently by passing the waveform
+        # to the incremental generator as an optional argument, which would be
+        # used to fill the queues initially.
+        outputs = [next_sample]
+        outputs.extend(net.push_ops)
+
+        print('Priming generation...')
+        for i, x in enumerate(waveform[:-(args.window + 1)]):
+            if i % 100 == 0:
+                print('Priming sample {}'.format(i))
+            sess.run(outputs, feed_dict={samples: x})
+        print('Done.')
+
+    last_sample_timestamp = datetime.now()
     for step in range(args.samples):
         if args.fast_generation:
-            window = waveform[-1]
             outputs = [next_sample]
             outputs.extend(net.push_ops)
+            window = waveform[-1]
         else:
             if len(waveform) > args.window:
                 window = waveform[-args.window:]
@@ -138,31 +174,40 @@ def main():
                 window = waveform
             outputs = [next_sample]
 
+        # Run the WaveNet to predict the next sample.
         prediction = sess.run(outputs, feed_dict={samples: window})[0]
         sample = np.random.choice(
             np.arange(quantization_channels), p=prediction)
         waveform.append(sample)
-        print('Sample {:3<d}/{:3<d}: {}'
-              .format(step + 1, args.samples, sample))
 
+        # Show progress only once per second.
+        current_sample_timestamp = datetime.now()
+        time_since_print = current_sample_timestamp - last_sample_timestamp
+        if time_since_print.total_seconds() > 1.:
+            print('Sample {:3<d}/{:3<d}'.format(step + 1, args.samples),
+                  end='\r')
+            last_sample_timestamp = current_sample_timestamp
+
+        # If we have partial writing, save the result so far.
         if (args.wav_out_path and args.save_every and
                 (step + 1) % args.save_every == 0):
-
             out = sess.run(decode, feed_dict={samples: waveform})
             write_wav(out, wavenet_params['sample_rate'], args.wav_out_path)
 
+    # Introduce a newline to clear the carriage return from the progress.
+    print()
+
+    # Save the result as an audio summary.
     datestring = str(datetime.now()).replace(' ', 'T')
     writer = tf.train.SummaryWriter(
         os.path.join(logdir, 'generation', datestring))
     tf.audio_summary('generated', decode, wavenet_params['sample_rate'])
     summaries = tf.merge_all_summaries()
-
     summary_out = sess.run(summaries,
-                           feed_dict={
-                               samples: np.reshape(waveform, [-1, 1])
-                           })
+                           feed_dict={samples: np.reshape(waveform, [-1, 1])})
     writer.add_summary(summary_out)
 
+    # Save the result as a wav file.
     if args.wav_out_path:
         out = sess.run(decode, feed_dict={samples: waveform})
         write_wav(out, wavenet_params['sample_rate'], args.wav_out_path)
