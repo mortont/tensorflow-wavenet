@@ -33,10 +33,9 @@ def find_global_features(directory):
     return out
 
 
-def feature_vectorizer(feature_dict, load_file=None, save_file='vectorizer.pkl'):
+def feature_vectorizer(feature_dict=None, load_file=None, save_file='vectorizer.pkl'):
     '''Vectorizes a feature dict with a saved vectorizer or
-    makes its own vectorizer and saves it if one is not given.
-    Returns a dense vector representation of the feature_dict'''
+    makes its own vectorizer and saves it if one is not given.'''
     if load_file:
         try:
             with open(load_file, 'rb') as file:
@@ -48,7 +47,7 @@ def feature_vectorizer(feature_dict, load_file=None, save_file='vectorizer.pkl')
         with open(save_file, 'wb') as file:
             pickle.dump(vectorizer, file)
 
-    return vectorizer.transform(feature_dict)
+    return vectorizer
 
 
 def load_generic_audio(directory, sample_rate):
@@ -70,7 +69,7 @@ def load_vctk_audio(directory, sample_rate):
         audio = audio.reshape(-1, 1)
         matches = speaker_re.findall(filename)[0]
         speaker_id, recording_id = [int(id_) for id_ in matches]
-        yield audio, speaker_id
+        yield audio, speaker_id, recording_id
 
 
 def trim_silence(audio, threshold):
@@ -101,10 +100,12 @@ class AudioReader(object):
         self.silence_threshold = silence_threshold
         self.threads = []
         self.sample_placeholder = tf.placeholder(dtype=tf.float32, shape=None)
+        self.global_features = tf.placeholder(dtype=tf.float32, shape=None)
         self.queue = tf.PaddingFIFOQueue(queue_size,
                                          ['float32'],
                                          shapes=[(None, 1)])
         self.enqueue = self.queue.enqueue([self.sample_placeholder])
+        self.vectorizer = feature_vectorizer(find_global_features(self.audio_dir))
 
     def dequeue(self, num_elements):
         output = self.queue.dequeue_many(num_elements)
@@ -115,8 +116,8 @@ class AudioReader(object):
         stop = False
         # Go through the dataset multiple times
         while not stop:
-            iterator = load_generic_audio(self.audio_dir, self.sample_rate)
-            for audio, filename in iterator:
+            iterator = load_vctk_audio(self.audio_dir, self.sample_rate)
+            for audio, speaker_id, recording_id in iterator:
                 if self.coord.should_stop():
                     stop = True
                     break
@@ -127,7 +128,7 @@ class AudioReader(object):
                         print("Warning: {} was ignored as it contains only "
                               "silence. Consider decreasing trim_silence "
                               "threshold, or adjust volume of the audio."
-                              .format(filename))
+                              .format(recording_id))
 
                 if self.sample_size:
                     # Cut samples into fixed size pieces
@@ -135,11 +136,13 @@ class AudioReader(object):
                     while len(buffer_) > self.sample_size:
                         piece = np.reshape(buffer_[:self.sample_size], [-1, 1])
                         sess.run(self.enqueue,
-                                 feed_dict={self.sample_placeholder: piece})
+                                 feed_dict={self.sample_placeholder: piece,
+                                     self.global_features: self.vectorizer.fit({'id': speaker_id})})
                         buffer_ = buffer_[self.sample_size:]
                 else:
                     sess.run(self.enqueue,
-                             feed_dict={self.sample_placeholder: audio})
+                             feed_dict={self.sample_placeholder: audio,
+                                 self.global_features: self.vectorizer.fit({'id': speaker_id})})
 
     def start_threads(self, sess, n_threads=1):
         for _ in range(n_threads):
