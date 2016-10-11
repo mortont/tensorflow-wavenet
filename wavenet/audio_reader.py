@@ -6,6 +6,8 @@ import threading
 import librosa
 import numpy as np
 import tensorflow as tf
+import pickle
+from sklearn.feature_extraction import DictVectorizer
 
 
 def find_files(directory, pattern='*.wav'):
@@ -17,14 +19,36 @@ def find_files(directory, pattern='*.wav'):
     return files
 
 
-def find_speakers(files):
-    '''Finds unique speaker ids in a list of files. To be used
-    with one-hot-encoded speaker ids'''
-    speakers = set()
-    speaker_re = re.compile(r'p([0-9]+)_([0-9]+)\.wav')
-    for filename in files:
-        speakers.add(speaker_re.findall(filename)[0][0])
-    return speakers
+def find_global_features(directory):
+    '''Uses speaker-info.txt file to map speaker id to
+    age, gender, and accent'''
+    with open(directory + '/speaker-info.txt', 'r') as file:
+        next(file)
+        features = [line.split()[:4] for line in file]
+
+    out = [{'id': speaker[0],
+        'age': speaker[1],
+        'gender': speaker[2],
+        'accent': speaker[3],} for speaker in features]
+    return out
+
+
+def feature_vectorizer(feature_dict, load_file=None, save_file='vectorizer.pkl'):
+    '''Vectorizes a feature dict with a saved vectorizer or
+    makes its own vectorizer and saves it if one is not given.
+    Returns a dense vector representation of the feature_dict'''
+    if load_file:
+        try:
+            with open(load_file, 'r') as file:
+                vectorizer = pickle.load(file)
+        except:
+            print('Error loading {}'.format(load_file))
+    else:
+        vectorizer = DictVectorizer(sparse=False).fit(feature_dict)
+        with open(save_file, 'wb') as file:
+            pickle.dump(vectorizer, file)
+
+    return vectorizer.transform(feature_dict)
 
 
 def load_generic_audio(directory, sample_rate):
