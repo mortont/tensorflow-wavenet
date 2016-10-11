@@ -39,7 +39,7 @@ def feature_vectorizer(feature_dict, load_file=None, save_file='vectorizer.pkl')
     Returns a dense vector representation of the feature_dict'''
     if load_file:
         try:
-            with open(load_file, 'r') as file:
+            with open(load_file, 'rb') as file:
                 vectorizer = pickle.load(file)
         except:
             print('Error loading {}'.format(load_file))
