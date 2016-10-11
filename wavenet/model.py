@@ -26,8 +26,10 @@ class WaveNetModel(object):
         filter_width = 2  # Convolutions just use 2 samples.
         residual_channels = 16  # Not specified in the paper.
         dilation_channels = 32  # Not specified in the paper.
+        skip_channels = 16      # Not specified in the paper.
         net = WaveNetModel(batch_size, dilations, filter_width,
-                           residual_channels, dilation_channel)
+                           residual_channels, dilation_channels,
+                           skip_channels)
         loss = net.loss(input_batch)
     '''
 
@@ -39,7 +41,9 @@ class WaveNetModel(object):
                  dilation_channels,
                  skip_channels,
                  quantization_channels=2**8,
-                 use_biases=False):
+                 use_biases=False,
+                 scalar_input=False,
+                 initial_filter_width=32):
         '''Initializes the WaveNet model.
 
         Args:
@@ -58,6 +62,12 @@ class WaveNetModel(object):
                 Default: 256 (8-bit quantization).
             use_biases: Whether to add a bias layer to each convolution.
                 Default: False.
+            scalar_input: Whether to use the quantized waveform directly as
+                input to the network instead of one-hot encoding it.
+                Default: False.
+            initial_filter_width: The width of the initial filter of the
+                convolution applied to the scalar input. This is only relevant
+                if scalar_input=True.
         '''
         self.batch_size = batch_size
         self.dilations = dilations
@@ -67,6 +77,8 @@ class WaveNetModel(object):
         self.quantization_channels = quantization_channels
         self.use_biases = use_biases
         self.skip_channels = skip_channels
+        self.scalar_input = scalar_input
+        self.initial_filter_width = initial_filter_width
 
         self.variables = self._create_variables()
 
@@ -80,10 +92,16 @@ class WaveNetModel(object):
         with tf.variable_scope('wavenet'):
             with tf.variable_scope('causal_layer'):
                 layer = dict()
+                if self.scalar_input:
+                    initial_channels = 1
+                    initial_filter_width = self.initial_filter_width
+                else:
+                    initial_channels = self.quantization_channels
+                    initial_filter_width = self.filter_width
                 layer['filter'] = create_variable(
                     'filter',
-                    [self.filter_width,
-                     self.quantization_channels,
+                    [initial_filter_width,
+                     initial_channels,
                      self.residual_channels])
                 var['causal_layer'] = layer
 
@@ -147,7 +165,7 @@ class WaveNetModel(object):
 
         return var
 
-    def _create_causal_layer(self, input_batch, in_channels, out_channels):
+    def _create_causal_layer(self, input_batch):
         '''Creates a single causal convolution layer.
 
         The layer can change the number of channels.
@@ -156,8 +174,7 @@ class WaveNetModel(object):
             weights_filter = self.variables['causal_layer']['filter']
             return causal_conv(input_batch, weights_filter, 1)
 
-    def _create_dilation_layer(self, input_batch, layer_index, dilation,
-                               in_channels, dilation_channels, skip_channels):
+    def _create_dilation_layer(self, input_batch, layer_index, dilation):
         '''Creates a single causal dilated convolution layer.
 
         The layer contains a gated filter that connects to dense output
@@ -226,8 +243,7 @@ class WaveNetModel(object):
             input_batch, curr_weights)
         return output
 
-    def _generator_causal_layer(self, input_batch, state_batch, in_channels,
-                                out_channels):
+    def _generator_causal_layer(self, input_batch, state_batch):
         with tf.name_scope('causal_layer'):
             weights_filter = self.variables['causal_layer']['filter']
             output = self._generator_conv(
@@ -235,8 +251,7 @@ class WaveNetModel(object):
         return output
 
     def _generator_dilation_layer(self, input_batch, state_batch, layer_index,
-                                  dilation, in_channels, dilation_channels,
-                                  skip_channels):
+                                  dilation):
         variables = self.variables['dilated_stack'][layer_index]
 
         weights_filter = variables['filter']
@@ -248,7 +263,7 @@ class WaveNetModel(object):
 
         if self.use_biases:
             output_filter = output_filter + variables['filter_bias']
-            conv_gate = output_gate + variables['gate_bias']
+            output_gate = output_gate + variables['gate_bias']
 
         out = tf.tanh(output_filter) * tf.sigmoid(output_gate)
 
@@ -270,17 +285,19 @@ class WaveNetModel(object):
         current_layer = input_batch
 
         # Pre-process the input with a regular convolution
-        current_layer = self._create_causal_layer(
-            current_layer, self.quantization_channels, self.residual_channels)
+        if self.scalar_input:
+            initial_channels = 1
+        else:
+            initial_channels = self.quantization_channels
+
+        current_layer = self._create_causal_layer(current_layer)
 
         # Add all defined dilation layers.
         with tf.name_scope('dilated_stack'):
             for layer_index, dilation in enumerate(self.dilations):
                 with tf.name_scope('layer{}'.format(layer_index)):
                     output, current_layer = self._create_dilation_layer(
-                        current_layer, layer_index, dilation,
-                        self.residual_channels, self.dilation_channels,
-                        self.skip_channels)
+                        current_layer, layer_index, dilation)
                     outputs.append(output)
 
         with tf.name_scope('postprocessing'):
@@ -332,8 +349,7 @@ class WaveNetModel(object):
         push_ops.append(push)
 
         current_layer = self._generator_causal_layer(
-            current_layer, current_state, self.quantization_channels,
-            self.residual_channels)
+                            current_layer, current_state)
 
         # Add all defined dilation layers.
         with tf.name_scope('dilated_stack'):
@@ -354,9 +370,7 @@ class WaveNetModel(object):
                     push_ops.append(push)
 
                     output, current_layer = self._generator_dilation_layer(
-                        current_layer, current_state, layer_index, dilation,
-                        self.residual_channels, self.dilation_channels,
-                        self.skip_channels)
+                        current_layer, current_state, layer_index, dilation)
                     outputs.append(output)
         self.init_ops = init_ops
         self.push_ops = push_ops
@@ -407,7 +421,11 @@ class WaveNetModel(object):
         If you want to generate audio by feeding the output of the network back
         as an input, see predict_proba_incremental for a faster alternative.'''
         with tf.name_scope(name):
-            encoded = self._one_hot(waveform)
+            if self.scalar_input:
+                encoded = tf.cast(waveform, tf.float32)
+                encoded = tf.reshape(encoded, [-1, 1])
+            else:
+                encoded = self._one_hot(waveform)
             raw_output = self._create_network(encoded)
             out = tf.reshape(raw_output, [-1, self.quantization_channels])
             # Cast to float64 to avoid bug in TensorFlow
@@ -426,6 +444,9 @@ class WaveNetModel(object):
         if self.filter_width > 2:
             raise NotImplementedError("Incremental generation does not "
                                       "support filter_width > 2.")
+        if self.scalar_input:
+            raise NotImplementedError("Incremental generation does not "
+                                      "support scalar input yet.")
         with tf.name_scope(name):
 
             encoded = tf.one_hot(waveform, self.quantization_channels)
@@ -449,12 +470,19 @@ class WaveNetModel(object):
         The variables are all scoped to the given name.
         '''
         with tf.name_scope(name):
-            # We mu-law encode and quantize the input audioform,
-            # and use this as input for the first layer.
+            # We mu-law encode and quantize the input audioform.
             input_batch = mu_law_encode(input_batch,
                                         self.quantization_channels)
+
             encoded = self._one_hot(input_batch)
-            raw_output = self._create_network(encoded)
+            if self.scalar_input:
+                network_input = tf.reshape(
+                    tf.cast(input_batch, tf.float32),
+                    [self.batch_size, -1, 1])
+            else:
+                network_input = encoded
+
+            raw_output = self._create_network(network_input)
 
             with tf.name_scope('loss'):
                 # Shift original input left by one sample, which means that
