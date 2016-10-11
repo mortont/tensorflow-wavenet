@@ -17,6 +17,16 @@ def find_files(directory, pattern='*.wav'):
     return files
 
 
+def find_speakers(files):
+    '''Finds unique speaker ids in a list of files. To be used
+    with one-hot-encoded speaker ids'''
+    speakers = set()
+    speaker_re = re.compile(r'p([0-9]+)_([0-9]+)\.wav')
+    for filename in files:
+        speakers.add(speaker_re.findall(filename)[0][0])
+    return speakers
+
+
 def load_generic_audio(directory, sample_rate):
     '''Generator that yields audio waveforms from the directory.'''
     files = find_files(directory)
