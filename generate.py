@@ -1,4 +1,5 @@
 from __future__ import division
+from __future__ import print_function
 
 import argparse
 from datetime import datetime
@@ -112,7 +113,9 @@ def main():
         dilation_channels=wavenet_params['dilation_channels'],
         quantization_channels=wavenet_params['quantization_channels'],
         skip_channels=wavenet_params['skip_channels'],
-        use_biases=wavenet_params['use_biases'])
+        use_biases=wavenet_params['use_biases'],
+        scalar_input=wavenet_params['scalar_input'],
+        initial_filter_width=wavenet_params['initial_filter_width'])
 
     samples = tf.placeholder(tf.int32)
 
@@ -199,8 +202,7 @@ def main():
 
     # Save the result as an audio summary.
     datestring = str(datetime.now()).replace(' ', 'T')
-    writer = tf.train.SummaryWriter(
-        os.path.join(logdir, 'generation', datestring))
+    writer = tf.train.SummaryWriter(logdir)
     tf.audio_summary('generated', decode, wavenet_params['sample_rate'])
     summaries = tf.merge_all_summaries()
     summary_out = sess.run(summaries,
